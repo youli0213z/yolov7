@@ -236,7 +236,7 @@ class Res(nn.Module):
 class ResX(Res):
     # ResNet bottleneck
     def __init__(self, c1, c2, shortcut=True, g=32, e=0.5):  # ch_in, ch_out, shortcut, groups, expansion
-        super().__init__(c1, c2, shortcu, g, e)
+        super().__init__(c1, c2, shortcut, g, e)
         c_ = int(c2 * e)  # hidden channels
 
 
@@ -820,7 +820,80 @@ class SPPF(nn.Module):
         y2 = self.m(y1)
         return self.cv2(torch.cat([x, y1, y2, self.m(y2)], 1))
     
-    
+class CrossConv(nn.Module):
+    # Cross Convolution Downsample
+    def __init__(self, c1, c2, k=3, s=1, g=1, e=1.0, shortcut=False):
+        # ch_in, ch_out, kernel, stride, groups, expansion, shortcut
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, (1, k), (1, s))
+        self.cv2 = Conv(c_, c2, (k, 1), (s, 1), g=g)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x):
+        return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+
+class GhostBottleneck(nn.Module):
+    # Ghost Bottleneck https://github.com/huawei-noah/ghostnet
+    def __init__(self, c1, c2, k=3, s=1):  # ch_in, ch_out, kernel, stride
+        super().__init__()
+        c_ = c2 // 2
+        self.conv = nn.Sequential(
+            GhostConv(c1, c_, 1, 1),  # pw
+            DWConv(c_, c_, k, s, act=False) if s == 2 else nn.Identity(),  # dw
+            GhostConv(c_, c2, 1, 1, act=False))  # pw-linear
+        self.shortcut = nn.Sequential(DWConv(c1, c1, k, s, act=False), Conv(c1, c2, 1, 1,
+                                                                            act=False)) if s == 2 else nn.Identity()
+
+    def forward(self, x):
+        return self.conv(x) + self.shortcut(x)
+
+class C3(nn.Module):
+    # CSP Bottleneck with 3 convolutions
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
+        self.cv3 = Conv(2 * c_, c2, 1)  # optional act=FReLU(c2)
+        self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
+
+    def forward(self, x):
+        return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
+
+
+class C3x(C3):
+    # C3 module with cross-convolutions
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)
+        self.m = nn.Sequential(*(CrossConv(c_, c_, 3, 1, g, 1.0, shortcut) for _ in range(n)))
+
+
+class C3TR(C3):
+    # C3 module with TransformerBlock()
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)
+        self.m = TransformerBlock(c_, c_, 4, n)
+
+
+class C3SPP(C3):
+    # C3 module with SPP()
+    def __init__(self, c1, c2, k=(5, 9, 13), n=1, shortcut=True, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)
+        self.m = SPP(c_, c_, k)
+
+
+class C3Ghost(C3):
+    # C3 module with GhostBottleneck()
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)  # hidden channels
+        self.m = nn.Sequential(*(GhostBottleneck(c_, c_) for _ in range(n)))
+
+
 class Contract(nn.Module):
     # Contract width-height into channels, i.e. x(1,64,80,80) to x(1,256,40,40)
     def __init__(self, gain=2):
@@ -1796,6 +1869,39 @@ class Mlp_v2(nn.Module):
         x = self.drop(x)
         return x
 
+def drop_path(x, drop_prob: float = 0., training: bool = False, scale_by_keep: bool = True):
+    """Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks).
+
+    This is the same as the DropConnect impl I created for EfficientNet, etc networks, however,
+    the original name is misleading as 'Drop Connect' is a different form of dropout in a separate paper...
+    See discussion: https://github.com/tensorflow/tpu/issues/494#issuecomment-532968956 ... I've opted for
+    changing the layer and argument names to 'drop path' rather than mix DropConnect as a layer name and use
+    'survival rate' as the argument.
+
+    """
+    if drop_prob == 0. or not training:
+        return x
+    keep_prob = 1 - drop_prob
+    shape = (x.shape[0],) + (1,) * (x.ndim - 1)  # work with diff dim tensors, not just 2D ConvNets
+    random_tensor = x.new_empty(shape).bernoulli_(keep_prob)
+    if keep_prob > 0.0 and scale_by_keep:
+        random_tensor.div_(keep_prob)
+    return x * random_tensor
+
+
+class DropPath(nn.Module):
+    """Drop paths (Stochastic Depth) per sample  (when applied in main path of residual blocks).
+    """
+    def __init__(self, drop_prob: float = 0., scale_by_keep: bool = True):
+        super(DropPath, self).__init__()
+        self.drop_prob = drop_prob
+        self.scale_by_keep = scale_by_keep
+
+    def forward(self, x):
+        return drop_path(x, self.drop_prob, self.training, self.scale_by_keep)
+
+    def extra_repr(self):
+        return f'drop_prob={round(self.drop_prob,3):0.3f}'
 
 def window_partition_v2(x, window_size):
     
